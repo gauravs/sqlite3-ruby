@@ -222,4 +222,20 @@ class IntegrationStatementTestCase < SQLite3::TestCase
   ensure
     @db.statement_timeout = 0
   end
+
+  # Deadline lives on the database struct, so re-executing a cached prepared
+  # statement after a sleep > timeout must not interrupt on the first progress
+  # tick using the prior execution's stale deadline. The CTE is just a cheap
+  # way to run >1000 opcodes so the progress handler actually fires.
+  def test_statement_timeout_resets_deadline_between_executions_of_same_stmt
+    @db.statement_timeout = 100
+    sql = "with recursive r(n) as (select 1 union all select n+1 from r where n<200) select count(*) from r"
+    stmt = @db.prepare(sql)
+    assert_equal [[200]], stmt.execute!.to_a
+    sleep 0.2
+    assert_equal [[200]], stmt.execute!.to_a
+    stmt.close
+  ensure
+    @db.statement_timeout = 0
+  end
 end
