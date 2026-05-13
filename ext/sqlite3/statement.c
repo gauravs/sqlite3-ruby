@@ -10,6 +10,22 @@
 
 VALUE cSqlite3Statement;
 
+static void *
+nogvl_step(void *ptr)
+{
+    sqlite3_stmt *stmt = (sqlite3_stmt *)ptr;
+    return (void *)(intptr_t)sqlite3_step(stmt);
+}
+
+// UBF: another thread is asking us to stop. sqlite3_interrupt is thread-safe
+// and causes the in-flight sqlite3_step to return SQLITE_INTERRUPT promptly.
+static void
+nogvl_interrupt(void *ptr)
+{
+    sqlite3 *db = (sqlite3 *)ptr;
+    sqlite3_interrupt(db);
+}
+
 static void
 statement_deallocate(void *data)
 {
@@ -139,7 +155,11 @@ step(VALUE self)
 
     stmt = ctx->st;
 
-    value = sqlite3_step(stmt);
+    sqlite3_ruby_in_nogvl = 1;
+    value = (int)(intptr_t)rb_thread_call_without_gvl(
+                nogvl_step, stmt,
+                nogvl_interrupt, ctx->db->db);
+    sqlite3_ruby_in_nogvl = 0;
     if (rb_errinfo() != Qnil) {
         /* some user defined function was invoked as a callback during step and
          * it raised an exception that has been suppressed until step returns.

@@ -2,6 +2,18 @@
 #define SQLITE3_RUBY
 
 #include <ruby.h>
+#include <ruby/thread.h>
+
+// Per-OS-thread flag: non-zero while a sqlite call on this thread is running
+// inside rb_thread_call_without_gvl. Sqlite invokes callbacks (busy_handler,
+// tracefunc, authorizer, collation, UDFs) synchronously on the same thread,
+// so they consult this flag to decide whether to re-acquire the GVL.
+#if defined(_MSC_VER)
+#  define SQLITE3_TLS __declspec(thread)
+#else
+#  define SQLITE3_TLS __thread
+#endif
+extern SQLITE3_TLS int sqlite3_ruby_in_nogvl;
 
 #ifdef UNUSED
 #elif defined(__GNUC__)

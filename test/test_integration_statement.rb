@@ -227,6 +227,36 @@ class IntegrationStatementTestCase < SQLite3::TestCase
   # statement after a sleep > timeout must not interrupt on the first progress
   # tick using the prior execution's stale deadline. The CTE is just a cheap
   # way to run >1000 opcodes so the progress handler actually fires.
+  # Without GVL release inside sqlite3_step, this test would hang for ~30s
+  # because Thread#kill is queued until step returns to Ruby. sqlite3_interrupt
+  # is wired as the unblocking function so the native call returns promptly.
+  def test_long_running_query_can_be_cancelled_from_another_thread
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    worker = Thread.new do
+      Thread.current.report_on_exception = false
+      @db.execute(SLOW_RECURSIVE_SQL)
+    end
+
+    sleep 0.05
+    worker.kill
+    worker.join(5) or flunk "worker thread did not unblock within 5s"
+
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    assert_operator elapsed, :<, 1.0, "expected cancellation within 1s, took #{elapsed}s"
+  end
+
+  # After cancellation the connection must still be usable — AR's connection
+  # pool depends on this rather than discarding the connection on interrupt.
+  def test_connection_remains_usable_after_interrupt
+    @db.statement_timeout = 10
+    assert_raises(SQLite3::InterruptException) { @db.execute(SLOW_RECURSIVE_SQL) }
+    @db.statement_timeout = 0
+
+    assert_equal [[1]], @db.execute("select 1")
+  ensure
+    @db.statement_timeout = 0
+  end
+
   def test_statement_timeout_resets_deadline_between_executions_of_same_stmt
     @db.statement_timeout = 100
     sql = "with recursive r(n) as (select 1 union all select n+1 from r where n<200) select count(*) from r"

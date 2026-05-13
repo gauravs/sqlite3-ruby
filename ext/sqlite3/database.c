@@ -247,12 +247,30 @@ total_changes(VALUE self)
     return INT2NUM(sqlite3_total_changes(ctx->db));
 }
 
+struct tracefunc_args {
+    VALUE self;
+    const char *sql;
+};
+
+static void *
+tracefunc_with_gvl(void *ptr)
+{
+    struct tracefunc_args *args = (struct tracefunc_args *)ptr;
+    VALUE thing = rb_iv_get(args->self, "@tracefunc");
+    rb_funcall(thing, rb_intern("call"), 1, rb_str_new2(args->sql));
+    return NULL;
+}
+
 static void
 tracefunc(void *data, const char *sql)
 {
-    VALUE self = (VALUE)data;
-    VALUE thing = rb_iv_get(self, "@tracefunc");
-    rb_funcall(thing, rb_intern("call"), 1, rb_str_new2(sql));
+    struct tracefunc_args args = { (VALUE)data, sql };
+
+    if (sqlite3_ruby_in_nogvl) {
+        rb_thread_call_with_gvl(tracefunc_with_gvl, &args);
+    } else {
+        tracefunc_with_gvl(&args);
+    }
 }
 
 /* call-seq:
@@ -283,17 +301,32 @@ trace(int argc, VALUE *argv, VALUE self)
     return self;
 }
 
+SQLITE3_TLS int sqlite3_ruby_in_nogvl = 0;
+
+struct busy_handler_args {
+    VALUE handle;
+    int count;
+};
+
+static void *
+busy_handler_call(void *ptr)
+{
+    struct busy_handler_args *args = (struct busy_handler_args *)ptr;
+    VALUE result = rb_funcall(args->handle, rb_intern("call"), 1, INT2NUM(args->count));
+    return (void *)(intptr_t)(result == Qfalse ? 0 : 1);
+}
+
 static int
 rb_sqlite3_busy_handler(void *context, int count)
 {
     sqlite3RubyPtr ctx = (sqlite3RubyPtr)context;
+    struct busy_handler_args args = { ctx->busy_handler, count };
 
-    VALUE handle = ctx->busy_handler;
-    VALUE result = rb_funcall(handle, rb_intern("call"), 1, INT2NUM(count));
+    if (sqlite3_ruby_in_nogvl) {
+        return (int)(intptr_t)rb_thread_call_with_gvl(busy_handler_call, &args);
+    }
 
-    if (Qfalse == result) { return 0; }
-
-    return 1;
+    return (int)(intptr_t)busy_handler_call(&args);
 }
 
 /* call-seq:
@@ -476,24 +509,39 @@ set_sqlite3_func_result(sqlite3_context *ctx, VALUE result)
     }
 }
 
+struct func_args {
+    sqlite3_context *ctx;
+    int argc;
+    sqlite3_value **argv;
+};
+
+static void *
+func_with_gvl(void *ptr)
+{
+    struct func_args *args = (struct func_args *)ptr;
+    VALUE callable = (VALUE)sqlite3_user_data(args->ctx);
+    VALUE params = rb_ary_new2(args->argc);
+    int i;
+
+    for (i = 0; i < args->argc; i++) {
+        rb_ary_push(params, sqlite3val2rb(args->argv[i]));
+    }
+
+    VALUE result = rb_apply(callable, rb_intern("call"), params);
+    set_sqlite3_func_result(args->ctx, result);
+    return NULL;
+}
+
 static void
 rb_sqlite3_func(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 {
-    VALUE callable = (VALUE)sqlite3_user_data(ctx);
-    VALUE params = rb_ary_new2(argc);
-    VALUE result;
-    int i;
+    struct func_args args = { ctx, argc, argv };
 
-    if (argc > 0) {
-        for (i = 0; i < argc; i++) {
-            VALUE param = sqlite3val2rb(argv[i]);
-            rb_ary_push(params, param);
-        }
+    if (sqlite3_ruby_in_nogvl) {
+        rb_thread_call_with_gvl(func_with_gvl, &args);
+    } else {
+        func_with_gvl(&args);
     }
-
-    result = rb_apply(callable, rb_intern("call"), params);
-
-    set_sqlite3_func_result(ctx, result);
 }
 
 #ifndef HAVE_RB_PROC_ARITY
@@ -627,6 +675,33 @@ changes(VALUE self)
     return INT2NUM(sqlite3_changes(ctx->db));
 }
 
+struct auth_args {
+    VALUE self;
+    int action;
+    const char *a;
+    const char *b;
+    const char *c;
+    const char *d;
+};
+
+static void *
+auth_with_gvl(void *ptr)
+{
+    struct auth_args *args = (struct auth_args *)ptr;
+    VALUE action = INT2NUM(args->action);
+    VALUE a      = args->a ? rb_str_new2(args->a) : Qnil;
+    VALUE b      = args->b ? rb_str_new2(args->b) : Qnil;
+    VALUE c      = args->c ? rb_str_new2(args->c) : Qnil;
+    VALUE d      = args->d ? rb_str_new2(args->d) : Qnil;
+    VALUE callback = rb_iv_get(args->self, "@authorizer");
+    VALUE result = rb_funcall(callback, rb_intern("call"), 5, action, a, b, c, d);
+
+    if (T_FIXNUM == TYPE(result)) { return (void *)(intptr_t)NUM2INT(result); }
+    if (Qtrue == result) { return (void *)(intptr_t)SQLITE_OK; }
+    if (Qfalse == result) { return (void *)(intptr_t)SQLITE_DENY; }
+    return (void *)(intptr_t)SQLITE_IGNORE;
+}
+
 static int
 rb_sqlite3_auth(
     void *ctx,
@@ -636,20 +711,12 @@ rb_sqlite3_auth(
     const char *_c,
     const char *_d)
 {
-    VALUE self   = (VALUE)ctx;
-    VALUE action = INT2NUM(_action);
-    VALUE a      = _a ? rb_str_new2(_a) : Qnil;
-    VALUE b      = _b ? rb_str_new2(_b) : Qnil;
-    VALUE c      = _c ? rb_str_new2(_c) : Qnil;
-    VALUE d      = _d ? rb_str_new2(_d) : Qnil;
-    VALUE callback = rb_iv_get(self, "@authorizer");
-    VALUE result = rb_funcall(callback, rb_intern("call"), 5, action, a, b, c, d);
+    struct auth_args args = { (VALUE)ctx, _action, _a, _b, _c, _d };
 
-    if (T_FIXNUM == TYPE(result)) { return (int)NUM2INT(result); }
-    if (Qtrue == result) { return SQLITE_OK; }
-    if (Qfalse == result) { return SQLITE_DENY; }
-
-    return SQLITE_IGNORE;
+    if (sqlite3_ruby_in_nogvl) {
+        return (int)(intptr_t)rb_thread_call_with_gvl(auth_with_gvl, &args);
+    }
+    return (int)(intptr_t)auth_with_gvl(&args);
 }
 
 /* call-seq: set_authorizer = auth
@@ -721,20 +788,21 @@ set_extended_result_codes(VALUE self, VALUE enable)
     return self;
 }
 
-int
-rb_comparator_func(void *ctx, int a_len, const void *a, int b_len, const void *b)
-{
+struct comparator_args {
     VALUE comparator;
-    VALUE a_str;
-    VALUE b_str;
-    VALUE comparison;
-    rb_encoding *internal_encoding;
+    int a_len;
+    int b_len;
+    const void *a;
+    const void *b;
+};
 
-    internal_encoding = rb_default_internal_encoding();
-
-    comparator = (VALUE)ctx;
-    a_str = rb_str_new((const char *)a, a_len);
-    b_str = rb_str_new((const char *)b, b_len);
+static void *
+comparator_with_gvl(void *ptr)
+{
+    struct comparator_args *args = (struct comparator_args *)ptr;
+    rb_encoding *internal_encoding = rb_default_internal_encoding();
+    VALUE a_str = rb_str_new((const char *)args->a, args->a_len);
+    VALUE b_str = rb_str_new((const char *)args->b, args->b_len);
 
     rb_enc_associate_index(a_str, rb_utf8_encindex());
     rb_enc_associate_index(b_str, rb_utf8_encindex());
@@ -744,9 +812,19 @@ rb_comparator_func(void *ctx, int a_len, const void *a, int b_len, const void *b
         b_str = rb_str_export_to_enc(b_str, internal_encoding);
     }
 
-    comparison = rb_funcall(comparator, rb_intern("compare"), 2, a_str, b_str);
+    VALUE comparison = rb_funcall(args->comparator, rb_intern("compare"), 2, a_str, b_str);
+    return (void *)(intptr_t)NUM2INT(comparison);
+}
 
-    return NUM2INT(comparison);
+int
+rb_comparator_func(void *ctx, int a_len, const void *a, int b_len, const void *b)
+{
+    struct comparator_args args = { (VALUE)ctx, a_len, b_len, a, b };
+
+    if (sqlite3_ruby_in_nogvl) {
+        return (int)(intptr_t)rb_thread_call_with_gvl(comparator_with_gvl, &args);
+    }
+    return (int)(intptr_t)comparator_with_gvl(&args);
 }
 
 /* call-seq: db.collation(name, comparator)
@@ -837,41 +915,74 @@ transaction_active_p(VALUE self)
     return sqlite3_get_autocommit(ctx->db) ? Qfalse : Qtrue;
 }
 
-static int
-hash_callback_function(VALUE callback_ary, int count, char **data, char **columns)
+struct exec_callback_args {
+    VALUE callback_ary;
+    int count;
+    char **data;
+    char **columns;
+};
+
+static void *
+hash_callback_with_gvl(void *ptr)
 {
+    struct exec_callback_args *args = (struct exec_callback_args *)ptr;
     VALUE new_hash = rb_hash_new();
     int i;
 
-    for (i = 0; i < count; i++) {
-        if (data[i] == NULL) {
-            rb_hash_aset(new_hash, rb_str_new_cstr(columns[i]), Qnil);
+    for (i = 0; i < args->count; i++) {
+        if (args->data[i] == NULL) {
+            rb_hash_aset(new_hash, rb_str_new_cstr(args->columns[i]), Qnil);
         } else {
-            rb_hash_aset(new_hash, rb_str_new_cstr(columns[i]), rb_str_new_cstr(data[i]));
+            rb_hash_aset(new_hash, rb_str_new_cstr(args->columns[i]), rb_str_new_cstr(args->data[i]));
         }
     }
 
-    rb_ary_push(callback_ary, new_hash);
+    rb_ary_push(args->callback_ary, new_hash);
+    return NULL;
+}
 
+static void *
+regular_callback_with_gvl(void *ptr)
+{
+    struct exec_callback_args *args = (struct exec_callback_args *)ptr;
+    VALUE new_ary = rb_ary_new();
+    int i;
+
+    for (i = 0; i < args->count; i++) {
+        if (args->data[i] == NULL) {
+            rb_ary_push(new_ary, Qnil);
+        } else {
+            rb_ary_push(new_ary, rb_str_new_cstr(args->data[i]));
+        }
+    }
+
+    rb_ary_push(args->callback_ary, new_ary);
+    return NULL;
+}
+
+static int
+hash_callback_function(VALUE callback_ary, int count, char **data, char **columns)
+{
+    struct exec_callback_args args = { callback_ary, count, data, columns };
+
+    if (sqlite3_ruby_in_nogvl) {
+        rb_thread_call_with_gvl(hash_callback_with_gvl, &args);
+    } else {
+        hash_callback_with_gvl(&args);
+    }
     return 0;
 }
 
 static int
 regular_callback_function(VALUE callback_ary, int count, char **data, char **columns)
 {
-    VALUE new_ary = rb_ary_new();
-    int i;
+    struct exec_callback_args args = { callback_ary, count, data, columns };
 
-    for (i = 0; i < count; i++) {
-        if (data[i] == NULL) {
-            rb_ary_push(new_ary, Qnil);
-        } else {
-            rb_ary_push(new_ary, rb_str_new_cstr(data[i]));
-        }
+    if (sqlite3_ruby_in_nogvl) {
+        rb_thread_call_with_gvl(regular_callback_with_gvl, &args);
+    } else {
+        regular_callback_with_gvl(&args);
     }
-
-    rb_ary_push(callback_ary, new_ary);
-
     return 0;
 }
 
@@ -884,28 +995,52 @@ regular_callback_function(VALUE callback_ary, int count, char **data, char **col
  * so the user may parse values with a block.
  * If no query is made, an empty array will be returned.
  */
+struct nogvl_exec_args {
+    sqlite3 *db;
+    const char *sql;
+    sqlite3_callback callback;
+    void *callback_arg;
+    char *errMsg;
+    int status;
+};
+
+static void *
+nogvl_exec(void *ptr)
+{
+    struct nogvl_exec_args *args = (struct nogvl_exec_args *)ptr;
+    args->status = sqlite3_exec(args->db, args->sql, args->callback, args->callback_arg, &args->errMsg);
+    return NULL;
+}
+
+static void
+nogvl_interrupt_db(void *ptr)
+{
+    sqlite3_interrupt((sqlite3 *)ptr);
+}
+
 static VALUE
 exec_batch(VALUE self, VALUE sql, VALUE results_as_hash)
 {
     sqlite3RubyPtr ctx;
-    int status;
     VALUE callback_ary = rb_ary_new();
-    char *errMsg;
+    struct nogvl_exec_args args;
 
     TypedData_Get_Struct(self, sqlite3Ruby, &database_type, ctx);
     REQUIRE_OPEN_DB(ctx);
 
-    if (results_as_hash == Qtrue) {
-        status = sqlite3_exec(ctx->db, StringValuePtr(sql), (sqlite3_callback)hash_callback_function,
-                              (void *)callback_ary,
-                              &errMsg);
-    } else {
-        status = sqlite3_exec(ctx->db, StringValuePtr(sql), (sqlite3_callback)regular_callback_function,
-                              (void *)callback_ary,
-                              &errMsg);
-    }
+    args.db = ctx->db;
+    args.sql = StringValuePtr(sql);
+    args.callback = (results_as_hash == Qtrue)
+                    ? (sqlite3_callback)hash_callback_function
+                    : (sqlite3_callback)regular_callback_function;
+    args.callback_arg = (void *)callback_ary;
+    args.errMsg = NULL;
 
-    CHECK_MSG(ctx->db, status, errMsg);
+    sqlite3_ruby_in_nogvl = 1;
+    rb_thread_call_without_gvl(nogvl_exec, &args, nogvl_interrupt_db, ctx->db);
+    sqlite3_ruby_in_nogvl = 0;
+
+    CHECK_MSG(ctx->db, args.status, args.errMsg);
 
     return callback_ary;
 }

@@ -113,10 +113,17 @@ rb_sqlite3_aggregate_instance_destroy(sqlite3_context *ctx)
     *inst_ptr = Qnil;
 }
 
-static void
-rb_sqlite3_aggregator_step(sqlite3_context *ctx, int argc, sqlite3_value **argv)
+struct aggregator_step_args {
+    sqlite3_context *ctx;
+    int argc;
+    sqlite3_value **argv;
+};
+
+static void *
+aggregator_step_with_gvl(void *ptr)
 {
-    VALUE inst = rb_sqlite3_aggregate_instance(ctx);
+    struct aggregator_step_args *a = (struct aggregator_step_args *)ptr;
+    VALUE inst = rb_sqlite3_aggregate_instance(a->ctx);
     VALUE handler_instance = rb_iv_get(inst, "-handler_instance");
     VALUE *params = NULL;
     VALUE one_param;
@@ -124,32 +131,45 @@ rb_sqlite3_aggregator_step(sqlite3_context *ctx, int argc, sqlite3_value **argv)
     int i;
 
     if (exc_status) {
-        return;
+        return NULL;
     }
 
-    if (argc == 1) {
-        one_param = sqlite3val2rb(argv[0]);
+    if (a->argc == 1) {
+        one_param = sqlite3val2rb(a->argv[0]);
         params = &one_param;
     }
-    if (argc > 1) {
-        params = xcalloc((size_t)argc, sizeof(VALUE));
-        for (i = 0; i < argc; i++) {
-            params[i] = sqlite3val2rb(argv[i]);
+    if (a->argc > 1) {
+        params = xcalloc((size_t)a->argc, sizeof(VALUE));
+        for (i = 0; i < a->argc; i++) {
+            params[i] = sqlite3val2rb(a->argv[i]);
         }
     }
     rb_sqlite3_protected_funcall(
-        handler_instance, rb_intern("step"), argc, params, &exc_status);
-    if (argc > 1) {
+        handler_instance, rb_intern("step"), a->argc, params, &exc_status);
+    if (a->argc > 1) {
         xfree(params);
     }
 
     rb_iv_set(inst, "-exc_status", INT2NUM(exc_status));
+    return NULL;
 }
 
-/* we assume that this function is only called once per execution context */
 static void
-rb_sqlite3_aggregator_final(sqlite3_context *ctx)
+rb_sqlite3_aggregator_step(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 {
+    struct aggregator_step_args args = { ctx, argc, argv };
+
+    if (sqlite3_ruby_in_nogvl) {
+        rb_thread_call_with_gvl(aggregator_step_with_gvl, &args);
+    } else {
+        aggregator_step_with_gvl(&args);
+    }
+}
+
+static void *
+aggregator_final_with_gvl(void *ptr)
+{
+    sqlite3_context *ctx = (sqlite3_context *)ptr;
     VALUE inst = rb_sqlite3_aggregate_instance(ctx);
     VALUE handler_instance = rb_iv_get(inst, "-handler_instance");
     int exc_status = NUM2INT(rb_iv_get(inst, "-exc_status"));
@@ -170,6 +190,18 @@ rb_sqlite3_aggregator_final(sqlite3_context *ctx)
     }
 
     rb_sqlite3_aggregate_instance_destroy(ctx);
+    return NULL;
+}
+
+/* we assume that this function is only called once per execution context */
+static void
+rb_sqlite3_aggregator_final(sqlite3_context *ctx)
+{
+    if (sqlite3_ruby_in_nogvl) {
+        rb_thread_call_with_gvl(aggregator_final_with_gvl, ctx);
+    } else {
+        aggregator_final_with_gvl(ctx);
+    }
 }
 
 /* call-seq: define_aggregator2(aggregator)
